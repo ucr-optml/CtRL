@@ -14,27 +14,27 @@ class Cell(nn.Module):
                  padding: int = 1, 
                  bias: bool = False):
         super().__init__()
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
+        # self.stride = stride
+        # self.padding = padding
+        # self.dilation = dilation
+        # self.groups = groups
         self.conv = nn.Conv2d(inplanes, planes, kernel_size, stride,
                               groups=groups, dilation=dilation, padding=padding, bias=bias)
-
         self.bn = nn.BatchNorm2d(planes)
         # self.bn.register_parameter('bias', None)
 
-        self.input_mask = torch.ones(inplanes, dtype=torch.bool).cuda()
-        self.output_mask = torch.ones(planes, dtype=torch.bool).cuda()
         self.mask = torch.ones(self.conv.weight.shape, dtype=torch.bool).cuda()
-
         self.free_conv_mask = torch.ones(self.conv.weight.shape, dtype=torch.bool).cuda()
-
-
 
     def forward(self, x):
         w = self.conv.weight * self.mask
         x = F.conv2d(
-            x, w, self.conv.bias, self.stride, self.padding, self.dilation, self.groups
+            x, w, self.conv.bias, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups
         )
         return self.bn(x)
+
+    def get_input_mask(self):
+        return torch.sum(self.mask, (0,2,3))>0
+    
+    def get_output_mask(self):
+        return torch.sum(self.mask, (1,2,3))>0

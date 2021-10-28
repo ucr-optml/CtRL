@@ -2,7 +2,6 @@ import math
 from re import S
 import torch
 from torch import Tensor
-# from torch._C import T
 import torch.nn as nn
 from typing import Type, Any, Callable, Union, List, Optional
 from . import Cell
@@ -55,13 +54,13 @@ class BasicBlock(nn.Module):
         return out
 
     def update_input_masks(self, input_mask):
-        self.cell1.input_mask = input_mask
-        self.cell2.input_mask = self.cell1.output_mask
+        self.cell1.mask &= input_mask.view(1, -1, 1, 1)
+        self.cell2.mask &= self.cell1.get_output_mask().view(1, -1, 1, 1)
         if self.downsample is not None:
-            self.downsample.input_mask = input_mask
-            return self.downsample.output_mask| self.cell2.output_mask
+            self.downsample.mask &= input_mask.view(1, -1, 1, 1)
+            return self.downsample.get_output_mask() | self.cell2.get_output_mask()
         else:
-            return input_mask | self.cell2.output_mask
+            return input_mask | self.cell2.get_output_mask()
 
 
 
@@ -107,14 +106,14 @@ class Bottleneck(nn.Module):
         return out
 
     def update_input_masks(self, input_mask):
-        self.cell1.input_mask = input_mask
-        self.cell2.input_mask = self.cell1.output_mask
-        self.cell3.input_mask = self.cell2.output_mask
+        self.cell1.mask &= input_mask.view(1, -1, 1, 1)
+        self.cell2.mask &= self.cell1.get_output_mask().view(1, -1, 1, 1)
+        self.cell3.mask &= self.cell2.get_output_mask().view(1, -1, 1, 1)
         if self.downsample is not None:
-            self.downsample.input_mask = input_mask
-            return self.downsample.output_mask | self.cell3.output_mask
+            self.downsample.mask &= input_mask.view(1, -1, 1, 1)
+            return self.downsample.get_output_mask() | self.cell3.get_output_mask()
         else:
-            return input_mask | self.cell3.output_mask
+            return input_mask | self.cell3.get_output_mask()
 
 
 
@@ -124,10 +123,9 @@ class GEMResNet(nn.Module):
         self,
         block: Type[Union[BasicBlock, Bottleneck]],
         layers: List[int],
-        num_classes: int = 1000,
         zero_init_residual: bool = False,
         groups: int = 1,
-        width_per_group: int = 64,
+        width_per_group: int = 20,
         replace_stride_with_dilation: Optional[List[bool]] = None,
     ) -> None:
         super(GEMResNet, self).__init__()
@@ -154,13 +152,25 @@ class GEMResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        self.last = nn.Linear(width_per_group * 8 * block.expansion, num_classes)
-        self.last_input_mask = torch.ones(width_per_group * 8 * block.expansion, dtype=torch.bool).cuda()
-        self.last_mask = torch.ones(self.last.weight.size(), dtype=torch.bool).cuda()
+        self.feature_num = width_per_group * 8 * block.expansion
+        self.task_hist = {}
+        self.classifiers = nn.ModuleDict()
+        self.mask = None
 
+    def _init_weights(self):
+        with torch.no_grad():
+            for m in self.modules():
+                if isinstance(m, Cell):
+                    nn.init.ones_(m.bn.weight)
+                    if m.bn.bias is not None:
+                        nn.init.zeros_(m.bn.bias)
+                    m.bn.running_mean.zero_()
+                    m.bn.running_var.fill_(1)
+                    m.bn.num_batches_tracked.zero_()
 
-
-
+                    m.conv.weight.data = m.conv.weight.data*~m.free_conv_mask + \
+                        nn.init.kaiming_normal_(m.conv.weight, mode='fan_out', nonlinearity='relu').cuda() * m.free_conv_mask
+                    
     def _make_layer(self, block: Type[Union[BasicBlock, Bottleneck]], planes: int, blocks: int,
                     stride: int = 1, dilate: bool = False) -> nn.Sequential:
         downsample = None
@@ -181,7 +191,7 @@ class GEMResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
+    def _forward_impl(self, x: Tensor, task_id) -> Tensor:
         # See note [TorchScript super()]
         x = self.cell1(x)
         x = self.relu(x)
@@ -193,39 +203,94 @@ class GEMResNet(nn.Module):
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.logits(x)
+        if task_id is None:
+            return x
+        x = self.logits(x, task_id)
         return x
 
-    def logits(self, x):
-        w = self.last.weight * self.last_mask
-        x = F.linear(x, w, self.last.bias)
+    def logits(self, x, task_id):
+        x = self.classifiers[str(task_id)](x)
         return x
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+    def forward(self, x: Tensor, task_id=None) -> Tensor:
+        return self._forward_impl(x, task_id)
 
-    def update_input_masks(self):            
-        self.cell1.input_mask = torch.ones(3, dtype=torch.bool).cuda()
-        input_mask = self.cell1.output_mask
+    def update_masks(self):            
+        input_mask = self.cell1.get_output_mask()
 
-        for m in self.layer1.modules():
+        for m in self.modules():
             if isinstance(m, (BasicBlock, Bottleneck)):
                 input_mask=m.update_input_masks(input_mask)
+        self.mask &= input_mask.view(1, -1)
 
-        for m in self.layer2.modules():
-            if isinstance(m, (BasicBlock, Bottleneck)):
-                input_mask=m.update_input_masks(input_mask)
+        for m in self.modules():
+            if isinstance(m, Cell):
+                m.bn.weight.data *= m.get_output_mask()
+                if m.bn.bias is not None:
+                    m.bn.bias.data *= m.get_output_mask()
+        # self.classifiers[str(task_id)].weight.data *= self.mask
 
-        for m in self.layer3.modules():
-            if isinstance(m, (BasicBlock, Bottleneck)):
-                input_mask=m.update_input_masks(input_mask)
+    def add_task(self, task_id, num_classes):
+        self.classifiers[str(task_id)] = nn.Linear(self.feature_num, num_classes).cuda()
+        self.task_hist[str(task_id)] = {}
+        self.task_hist[str(task_id)]['num_classes'] = num_classes
+        self.task_hist[str(task_id)]['order'] = len(self.task_hist.keys())
+        for m in self.modules():
+            if isinstance(m, Cell):
+                m.mask = torch.ones(m.conv.weight.shape, dtype=torch.bool).cuda()
+        self.mask = torch.ones(self.classifiers[str(task_id)].weight.shape, dtype=torch.bool).cuda()
+        self._init_weights()
+        self.update_masks()
 
-        for m in self.layer4.modules():
-            if isinstance(m, (BasicBlock, Bottleneck)):
-                input_mask=m.update_input_masks(input_mask)
+    def set_task(self, task_id, cp):
+        if not str(task_id) in self.task_hist.keys():
+            raise ValueError('task id {} is not trained!'.format(task_id))
+        channel_weights = cp['channel_weights']
+        channel_biases = cp['channel_biases']
+        running_means = cp['running_means']
+        running_vars = cp['running_vars']
+        num_batches_tracked = cp['num_batches_tracked']
+        masks = cp['masks']
+        for n, m in self.named_modules():
+            if isinstance(m, Cell):
+                m.bn.weight.data = channel_weights[n]
+                if m.bn.bias is not None:
+                    m.bn.bias.data = channel_biases[n]
+                m.bn.running_mean = running_means[n]
+                m.bn.running_var = running_vars[n]
+                m.bn.num_batches_tracked = num_batches_tracked[n]
+                m.mask = masks[n]
+        self.mask = torch.ones(self.classifiers[str(task_id)].weight.shape, dtype=torch.bool).cuda()
+        self.update_masks()
 
-        self.last_input_mask = input_mask.clone()  # [1,512,1,1]
+    def load_state_dict(self, filename):
+        checkpoint = torch.load(filename)
+        task_hist = checkpoint['task_hist']
+        state_dict = checkpoint['state_dict']
+        free_masks = checkpoint['free_masks']
+        self.classifiers = nn.ModuleDict({k: nn.Linear(self.feature_num, v['num_classes']).cuda() for k, v in task_hist.items()})
+        super().load_state_dict(state_dict)
+        self.task_hist = task_hist
+        for n, m in self.named_modules():
+            if isinstance(m, Cell):
+                m.free_conv_mask = free_masks[n]
+    
+    def save_state_dict(self, filename):
+        free_masks = {}
+        for n, m in self.named_modules():
+            if isinstance(m, Cell):
+                free_masks[n] = m.free_conv_mask
+        checkpoint = {}
+        checkpoint['task_hist'] = self.task_hist
+        checkpoint['state_dict'] = self.state_dict()
+        checkpoint['free_masks'] = free_masks
+        torch.save(checkpoint, filename)
+    
+    def task_exists(self, task_id):
+        return str(task_id) in self.task_hist.keys()
 
+
+## TODO
 class ResNet(nn.Module):
 
     def __init__(
@@ -353,10 +418,10 @@ class ResNet(nn.Module):
 
 
 
+def GEMResNet18(width_per_group=20) -> GEMResNet:
+    return GEMResNet(BasicBlock, [2, 2, 2, 2], width_per_group=width_per_group)
 
-def GEMResNet18(num_classes, width_per_group=20) -> GEMResNet:
-    return GEMResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, width_per_group=width_per_group)
-
+################### TODO #######################
 def ResNet50(num_classes) -> ResNet:
     return ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
 

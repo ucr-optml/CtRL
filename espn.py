@@ -16,11 +16,11 @@ parser.add_argument('--checkpoint_format', type=str,
                     help='checkpoint file format')
 parser.add_argument('--seed', type=int, default=1,
                     help='Random seed')
-parser.add_argument('--seed_data', type=int, default=1,
+parser.add_argument('--seed_data', type=int, default=-1,
                     help='Random seed to generate random tasks')
 parser.add_argument('--arch', type=str, default='GEMResNet18', 
                     help='Architecture')
-parser.add_argument('--dataset', type=str, default='SplitCIFAR100-20', 
+parser.add_argument('--dataset', type=str, default='SplitCIFAR100', 
                     help='Dataset')
 parser.add_argument('--num_classes', type=int, default=5, 
                     help='number of classes')
@@ -59,9 +59,9 @@ def main():
 
     # Model
     if args.arch in ['GEMResNet18', 'ResNet50']:
-        model = models.__dict__[args.arch](num_classes=args.num_classes)
+        model = models.__dict__[args.arch]()
     else:
-        ValueError('TODO: model {}'.format(args.arch))
+        raise ValueError('TODO: model {}'.format(args.arch))
     model = nn.DataParallel(model)
     model = model.module.cuda()
     # print(model)
@@ -69,27 +69,12 @@ def main():
     # 
     filepath = args.checkpoint_format.format(seed=args.seed, arch=args.arch, \
         dataset=args.dataset, seed_data=args.seed_data, mode=args.alloc_mode)
-    if os.path.exists(filepath):
-        checkpoint = torch.load(filepath+'/shared_info.pth.tar')
-        trained_tasks = checkpoint['trained_tasks']
-        state_dict = checkpoint['state_dict']
-        free_masks = checkpoint['free_masks']
-        for n, m in model.named_modules():
-            if isinstance(m, Cell):
-                m.free_conv_mask = free_masks[n]
-        model.load_state_dict(state_dict)
-    else:
+    if not os.path.exists(filepath):
         os.makedirs(filepath)
-        checkpoint = {}
-        trained_tasks = []
-        free_masks = {}
-        for n, m in model.named_modules():
-            if isinstance(m, Cell):
-                free_masks[n] = torch.ones(m.conv.weight.shape, dtype=torch.bool).cuda()
-        checkpoint['trained_tasks'] = trained_tasks
-        checkpoint['state_dict'] = model.state_dict()
-        checkpoint['free_masks'] = free_masks
-        torch.save(checkpoint, filepath+'/shared_info.pth.tar')
+    if os.path.exists(filepath+'/shared_info.pth.tar'):
+        model.load_state_dict(filepath+'/shared_info.pth.tar')
+    else:
+        model.save_state_dict(filepath+'/shared_info.pth.tar')
         
     if 'SplitCIFAR100' in args.dataset:
         data_loaders = RandSplitCIFAR100(args)
@@ -98,54 +83,44 @@ def main():
     elif 'CIFAR10' in args.dataset:
         data_loaders = CIFAR10(args)
     else:
-        ValueError('TODO: dataset {}'.format(args.dataset))
+        raise ValueError('TODO: dataset {}'.format(args.dataset))
     manager = Manager(args, model, data_loaders, filepath)
-    trained_num=len(trained_tasks)
     accuracy = []
     channel = []
     for i in range(len(args.taskIDs)):
         task_id = args.taskIDs[i]
-        if task_id in trained_tasks:
+        if model.task_exists(task_id):
             print('Task {} is already trained. Evaluating...'.format(task_id))
+            manager.set_task(task_id)
             summary = manager.validate(task_id)
             accuracy.append(summary['acc'])
             channel.append(channel_count(model))
             continue
         print('Train task {} ...'.format(task_id))
-        manager.add_task(task_id)
-        manager.warmup(args.warmup)
+        manager.add_task(task_id, num_classes=args.num_classes)
+        # warmup and pretrain
+        manager.warmup(args.warmup, task_id)
         for epoch in range(args.warmup, args.pruning_iter[0]):
-            manager.train(epoch)
+            manager.train(epoch, task_id)
         # get iterative pruning ratio
         res_FLOP_iter = manager.get_res_FLOP_iter()
-        res_sparsity_iter = manager.get_res_sparsity_iter(trained_num)
+        res_sparsity_iter = manager.get_res_sparsity_iter()
         print('res_FLOP_iter: ', res_FLOP_iter)
         print('res_sparsity_iter: ', res_sparsity_iter)
+        # pruning
         for epoch in range(args.pruning_iter[0], args.pruning_iter[1]):
-            manager.prune(res_FLOP_iter[epoch], res_sparsity_iter[epoch])
-            manager.train(epoch, 'prune')
-        # manager.update_free_conv_mask()
+            manager.prune(task_id, res_FLOP_iter[epoch], res_sparsity_iter[epoch])
+            manager.train(epoch, task_id, mode='prune')
+        # finetuning
         for epoch in range(args.pruning_iter[1], args.epochs):
-            manager.train(epoch, 'finetune')
+            manager.train(epoch, task_id, mode='finetune')
         manager.save_checkpoint(task_id)
         manager.update_free_conv_mask()
-        trained_num += 1
 
         # save checkpoint for main body
-        free_masks = {}
-        for n, m in model.named_modules():
-            if isinstance(m, Cell):
-                free_masks[n] = m.free_conv_mask
-        trained_tasks.append(task_id)
-       
-        checkpoint = {
-            'state_dict': model.state_dict(),
-            'free_masks': free_masks,
-            'trained_tasks': trained_tasks,
-            # 'args': args,
-        }
-        torch.save(checkpoint, filepath+'/shared_info.pth.tar')
+        model.save_state_dict(filepath+'/shared_info.pth.tar')
         for j in range(i+1):
+            manager.set_task(args.taskIDs[j])
             summary = manager.validate(args.taskIDs[j])
         accuracy.append(summary['acc'])
 
@@ -158,8 +133,8 @@ def channel_count(model):
     num = 0
     for m in model.modules():
         if isinstance(m, Cell):
-            all += m.output_mask.numel()
-            num += m.output_mask.sum()
+            all += m.get_output_mask().numel()
+            num += m.get_output_mask().sum()
     return (num.float()/all).item()
 
 if __name__ == '__main__':
