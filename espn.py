@@ -52,7 +52,7 @@ def main():
 
     # Prepare
     if not torch.cuda.is_available():
-        ValueError('no gpu device available')
+        raise ValueError('no gpu device available')
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True

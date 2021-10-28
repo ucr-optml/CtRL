@@ -97,7 +97,7 @@ class Manager(object):
             num = torch.cat([m.get_output_mask() for m in self.model.modules() if isinstance(m, Cell)]).sum()
             sparsity_loss = 1.  * torch.norm(factors, 1)/ num  # factors.numel()
         else:
-            ValueError('reg {} does not exist!'.format(self.config['reg']))
+            raise ValueError('reg {} does not exist!'.format(self.config['reg']))
 
         loss += self.args.lam * sparsity_loss
         
